@@ -62,19 +62,34 @@ def get_historical_prices(holdings_list_of_pairs, start_date, end_date):
 @st.cache_data
 def calculate_daily_values(_trades_df, _prices_df):
     df = _trades_df.copy()
+    
     usd_map = _prices_df['SGDUSD=X']
     df['Exchange Rate'] = df['Date'].dt.floor('D').map(usd_map)
-    df['Exchange Rate'].bfill(inplace=True).ffill(inplace=True)
-    df['Trade Price (USD)'] = df.apply(lambda row: row['Trade Price'] * row['Exchange Rate'] if row['Currency'] == 'SGD' else row['Trade Price'], axis=1)
+    
+    # --- THIS IS THE FIX ---
+    # The inplace operations must be on separate lines because they return None.
+    df['Exchange Rate'].bfill(inplace=True)
+    df['Exchange Rate'].ffill(inplace=True)
+    
+    df['Trade Price (USD)'] = df.apply(
+        lambda row: row['Trade Price'] * row['Exchange Rate'] if row['Currency'] == 'SGD' else row['Trade Price'],
+        axis=1
+    )
     df['Adjusted Cashflow (USD)'] = (df['Quantity'] * df['Trade Price (USD)'] * -1) - df['Comm/Fee'].fillna(0)
+
     if df['Adjusted Cashflow (USD)'].isnull().any():
+        st.error("Error: NaN values created during cashflow calculation.")
+        st.dataframe(df[df['Adjusted Cashflow (USD)'].isnull()])
         st.stop()
+
     daily_qty = df.pivot_table(index='Date', columns='Symbol', values='Quantity', aggfunc='sum').cumsum()
     daily_qty = daily_qty.reindex(_prices_df.index, method='ffill').fillna(0)
+    
     original_symbols = [s for s, c in get_holdings(df)]
     aligned_prices, aligned_qty = _prices_df[original_symbols].align(daily_qty, join='left', axis=1, fill_value=0)
     daily_value = aligned_prices * aligned_qty
     daily_value['Total Portfolio Value'] = daily_value.sum(axis=1)
+    
     return daily_value, df
 
 @st.cache_data
@@ -82,18 +97,23 @@ def calculate_xirr(_trades_df, _prices_df):
     xirr_results = {}
     last_date = _prices_df.index[-1]
     holdings_list = get_holdings(_trades_df)
+    
     for symbol, currency in holdings_list:
         asset_trades = _trades_df[_trades_df['Symbol'] == symbol].copy()
         current_quantity = asset_trades['Quantity'].sum()
+        
         last_price = _prices_df[symbol].iloc[-1]
+        
         if abs(current_quantity) > 0.001 and pd.notna(last_price):
             closing_value = current_quantity * last_price
             closing_trade = pd.DataFrame({'Date': [last_date], 'Adjusted Cashflow (USD)': [closing_value]})
             cash_flows = pd.concat([asset_trades[['Date', 'Adjusted Cashflow (USD)']], closing_trade], ignore_index=True)
         else:
             cash_flows = asset_trades[['Date', 'Adjusted Cashflow (USD)']].copy()
+
         cash_flows = cash_flows.dropna(subset=['Adjusted Cashflow (USD)'])
         cash_flows = cash_flows[cash_flows['Adjusted Cashflow (USD)'].abs() > 0.01]
+        
         if len(cash_flows['Date'].unique()) > 1:
             try:
                 xirr_value = npf.xirr(cash_flows['Adjusted Cashflow (USD)'].values, cash_flows['Date'].dt.date.values)
@@ -104,7 +124,6 @@ def calculate_xirr(_trades_df, _prices_df):
             xirr_results[symbol] = None
     return xirr_results
 
-# --- THIS IS THE FIX: The entire function is wrapped in a try...except block ---
 @st.cache_data(ttl=3600)
 def get_news(yfinance_ticker_obj):
     try:
@@ -118,14 +137,13 @@ def get_news(yfinance_ticker_obj):
         url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}&pageSize=5&sortBy=relevancy&language=en"
         
         r = requests.get(url)
-        r.raise_for_status() # This will raise an error for 4xx or 5xx responses
+        r.raise_for_status()
         
         data = r.json()
         articles = [f"- [{article['title']}]({article['url']}) ({article['source']['name']})" for article in data['articles']]
         
         return articles if articles else ["No recent news found."]
     except Exception as e:
-        # If anything fails (network, bad API key, etc.), return a safe error message
         return [f"Could not fetch news. The API may be unavailable or the key may be invalid. (Error: {e})"]
 
 # --- MAIN APP LOGIC ---
@@ -142,7 +160,6 @@ if not trades_df.empty:
     historical_prices = get_historical_prices(holdings, start_date, end_date)
     daily_portfolio_value, final_trades_df = calculate_daily_values(adjusted_trades_df, historical_prices)
     
-    # Check for empty results before calculating metrics or drawing charts
     if not daily_portfolio_value.empty:
         xirr_values = calculate_xirr(final_trades_df, historical_prices)
         tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "📈 Holdings Analysis", "🗃️ Data Explorer"])
