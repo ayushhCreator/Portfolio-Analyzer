@@ -1,0 +1,11 @@
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Operating System generated files
+.DS_Store
+Thumbs.db
+
+# Optional: If you don't want to share the raw data
+# *.csv
