@@ -2,215 +2,571 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import numpy_financial as npf
+from datetime import datetime, timedelta
+import warnings
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime
-import requests
+import re
+
+
+warnings.filterwarnings('ignore')
+
+
 
 # --- CONFIGURATION ---
 BASE_CURRENCY = "USD"
 FILES = ['Stock_trading_2023.csv', 'Stock_trading_2024.csv', 'Stock_trading_2025.csv']
-NEWS_API_KEY = "148950622340442b94d1387dea89c798" 
 
-# --- DATA LOADING & CLEANING ---
+# --- 1. DATA LOADING & CLEANING ---
 @st.cache_data
-def load_data(files):
+def load_and_consolidate_data(files):
+    """Step 1: Create a simple data structure to append and store the files."""
     all_trades = []
     for file in files:
         try:
             df = pd.read_csv(file, thousands=',', on_bad_lines='skip')
-            all_trades.append(df)
+            if not df.empty:
+                df['source_file'] = file
+                all_trades.append(df)
         except FileNotFoundError:
             st.error(f"Error: The file {file} was not found.")
-            return pd.DataFrame()
-    master_df = pd.concat(all_trades, ignore_index=True)
-    master_df.dropna(how='all', inplace=True)
-    master_df = master_df[master_df['Header'] == 'Data']
-    master_df['Date/Time'] = pd.to_datetime(master_df['Date/Time'])
+            continue
+    
+    if not all_trades:
+        return pd.DataFrame()
+        
+    # Consolidate all data
+    consolidated_df = pd.concat(all_trades, ignore_index=True)
+    consolidated_df = consolidated_df[consolidated_df['Header'] == 'Data'].copy()
+    consolidated_df['Date/Time'] = pd.to_datetime(consolidated_df['Date/Time'])
+    
+    # Clean numeric columns
     numeric_cols = ['Quantity', 'T. Price', 'C. Price', 'Proceeds', 'Comm/Fee', 'Basis', 'Realized P/L', 'MTM P/L']
     for col in numeric_cols:
-        master_df[col] = pd.to_numeric(master_df[col], errors='coerce')
-    master_df.dropna(subset=['Quantity', 'T. Price', 'Date/Time'], inplace=True)
-    master_df.sort_values(by='Date/Time', inplace=True)
-    master_df.rename(columns={'T. Price': 'Trade Price', 'Date/Time': 'Date'}, inplace=True)
-    return master_df
+        consolidated_df[col] = pd.to_numeric(consolidated_df[col], errors='coerce')
+    
+    # Clean and sort
+    consolidated_df.dropna(subset=['Quantity', 'T. Price', 'Date/Time'], inplace=True)
+    consolidated_df.sort_values('Date/Time', inplace=True)
+    consolidated_df.rename(columns={'T. Price': 'Trade_Price', 'Date/Time': 'Trade_Date'}, inplace=True)
+    
+    return consolidated_df
 
-# --- CORE FUNCTIONS ---
-def get_holdings(df):
-    unique_holdings = df[['Symbol', 'Currency']].drop_duplicates().values.tolist()
-    return unique_holdings
-
+# --- 2. MASTER HOLDINGS LIST ---
 @st.cache_data
-def adjust_for_splits(_df, holdings_list):
-    return _df.copy() # Pass-through function
+def create_master_holdings_list(_df):
+    """Step 2: Create a master list of holdings"""
+    if _df.empty:
+        return []
+    
+    holdings = _df[['Symbol', 'Currency']].drop_duplicates()
+    holdings_list = [(row['Symbol'], row['Currency']) for _, row in holdings.iterrows()]
+    return holdings_list
 
+# --- 3. STOCK SPLIT DETAILS ---
 @st.cache_data
-def get_historical_prices(holdings_list_of_pairs, start_date, end_date):
-    yfinance_tickers = []
-    rename_map = {}
-    for symbol, currency in holdings_list_of_pairs:
-        yfinance_symbol = symbol
-        if currency == 'SGD':
-            yfinance_symbol = f"{symbol}.SI"
-        yfinance_tickers.append(yfinance_symbol)
-        rename_map[yfinance_symbol] = symbol
-    yfinance_tickers.append('SGDUSD=X')
-    prices = yf.download(yfinance_tickers, start=start_date, end=end_date, progress=False, auto_adjust=False)['Adj Close']
-    prices.ffill(inplace=True)
-    prices.bfill(inplace=True)
-    prices.rename(columns=rename_map, inplace=True)
-    return prices
-
-@st.cache_data
-def calculate_daily_values(_trades_df, _prices_df):
-    df = _trades_df.copy()
-    
-    usd_map = _prices_df['SGDUSD=X']
-    df['Exchange Rate'] = df['Date'].dt.floor('D').map(usd_map)
-    
-    # --- THIS IS THE FIX ---
-    # The inplace operations must be on separate lines because they return None.
-    df['Exchange Rate'].bfill(inplace=True)
-    df['Exchange Rate'].ffill(inplace=True)
-    
-    df['Trade Price (USD)'] = df.apply(
-        lambda row: row['Trade Price'] * row['Exchange Rate'] if row['Currency'] == 'SGD' else row['Trade Price'],
-        axis=1
-    )
-    df['Adjusted Cashflow (USD)'] = (df['Quantity'] * df['Trade Price (USD)'] * -1) - df['Comm/Fee'].fillna(0)
-
-    if df['Adjusted Cashflow (USD)'].isnull().any():
-        st.error("Error: NaN values created during cashflow calculation.")
-        st.dataframe(df[df['Adjusted Cashflow (USD)'].isnull()])
-        st.stop()
-
-    daily_qty = df.pivot_table(index='Date', columns='Symbol', values='Quantity', aggfunc='sum').cumsum()
-    daily_qty = daily_qty.reindex(_prices_df.index, method='ffill').fillna(0)
-    
-    original_symbols = [s for s, c in get_holdings(df)]
-    aligned_prices, aligned_qty = _prices_df[original_symbols].align(daily_qty, join='left', axis=1, fill_value=0)
-    daily_value = aligned_prices * aligned_qty
-    daily_value['Total Portfolio Value'] = daily_value.sum(axis=1)
-    
-    return daily_value, df
-
-@st.cache_data
-def calculate_xirr(_trades_df, _prices_df):
-    xirr_results = {}
-    last_date = _prices_df.index[-1]
-    holdings_list = get_holdings(_trades_df)
+def get_stock_splits(holdings_list):
+    """Step 3: Get stock split details for all holdings"""
+    all_splits = {}
     
     for symbol, currency in holdings_list:
-        asset_trades = _trades_df[_trades_df['Symbol'] == symbol].copy()
-        current_quantity = asset_trades['Quantity'].sum()
-        
-        last_price = _prices_df[symbol].iloc[-1]
-        
-        if abs(current_quantity) > 0.001 and pd.notna(last_price):
-            closing_value = current_quantity * last_price
-            closing_trade = pd.DataFrame({'Date': [last_date], 'Adjusted Cashflow (USD)': [closing_value]})
-            cash_flows = pd.concat([asset_trades[['Date', 'Adjusted Cashflow (USD)']], closing_trade], ignore_index=True)
-        else:
-            cash_flows = asset_trades[['Date', 'Adjusted Cashflow (USD)']].copy()
+        yf_symbol = f"{symbol}.SI" if currency == 'SGD' else symbol
+        try:
+            ticker = yf.Ticker(yf_symbol)
+            splits = ticker.splits
+            if not splits.empty:
+                # Convert to DataFrame for easier handling
+                split_df = splits.reset_index()
+                split_df.columns = ['Split_Date', 'Split_Ratio']
+                split_df['Split_Date'] = pd.to_datetime(split_df['Split_Date']).dt.tz_localize(None)
+                split_df = split_df.sort_values('Split_Date')
+                all_splits[symbol] = split_df
+        except Exception:
+            continue
+    
+    return all_splits
 
-        cash_flows = cash_flows.dropna(subset=['Adjusted Cashflow (USD)'])
-        cash_flows = cash_flows[cash_flows['Adjusted Cashflow (USD)'].abs() > 0.01]
+# --- 4. SPLIT ADJUSTMENT ---
+@st.cache_data
+def apply_split_adjustments(_trades_df, _splits_dict):
+    """Step 4: Transform input files to reflect split adjusted price and quantity"""
+    df = _trades_df.copy()
+    
+    for symbol, splits_df in _splits_dict.items():
+        symbol_mask = df['Symbol'] == symbol
+        symbol_trades = df[symbol_mask].copy()
         
-        if len(cash_flows['Date'].unique()) > 1:
+        if symbol_trades.empty:
+            continue
+        
+        # Apply splits iteratively based on split date
+        for _, split_row in splits_df.iterrows():
+            split_date = split_row['Split_Date']
+            split_ratio = split_row['Split_Ratio']
+            
+            # Find trades before this split date
+            pre_split_mask = (df['Symbol'] == symbol) & (df['Trade_Date'] < split_date)
+            
+            if pre_split_mask.any():
+                # If split is 1:2 (ratio = 2), quantity doubles, price halves
+                df.loc[pre_split_mask, 'Quantity'] *= split_ratio
+                df.loc[pre_split_mask, 'Trade_Price'] /= split_ratio
+    
+    # Recalculate adjusted cashflow
+    df['Adjusted_Cashflow_Local'] = df['Quantity'] * df['Trade_Price'] * -1
+    df['Comm_Fee'] = df['Comm/Fee'].fillna(0)
+    df['Total_Cashflow_Local'] = df['Adjusted_Cashflow_Local'] - df['Comm_Fee']
+    
+    return df
+
+# --- 5. CURRENCY EXCHANGE RATES ---
+@st.cache_data
+def get_currency_rates(start_date, end_date):
+    """Step 5: Get historical daily currency pairing for each date (USD, INR, SGD)"""
+    try:
+        # Download currency rates
+        currency_pairs = ['SGDUSD=X', 'INRUSD=X']  # USD is base
+        
+        rates = yf.download(currency_pairs, start=start_date, end=end_date, progress=False)['Close']
+        
+        # Handle single currency case
+        if len(currency_pairs) == 1:
+            rates = rates.to_frame(currency_pairs[0])
+        
+        # Create full date range and forward fill
+        full_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+        rates = rates.reindex(full_dates)
+        rates = rates.fillna(method='ffill').fillna(method='bfill')
+        
+        # Add USD rate (always 1)
+        rates['USDUSD=X'] = 1.0
+        
+        return rates
+        
+    except Exception as e:
+        st.error(f"Error downloading currency rates: {e}")
+        return pd.DataFrame()
+
+# --- 6. CURRENCY CONVERSION ---
+def convert_to_usd(_trades_df, _currency_rates):
+    """Step 6: Compute transaction price in each currency (convert to USD)"""
+    df = _trades_df.copy()
+    
+    # Map currency rates to trade dates
+    df['Trade_Date_Key'] = df['Trade_Date'].dt.floor('D')
+    
+    def get_usd_rate(row):
+        date_key = row['Trade_Date_Key']
+        currency = row['Currency']
+        
+        if currency == 'USD':
+            return 1.0
+        elif currency == 'SGD':
+            return _currency_rates.loc[date_key, 'SGDUSD=X'] if date_key in _currency_rates.index else 0.74
+        elif currency == 'INR':
+            return _currency_rates.loc[date_key, 'INRUSD=X'] if date_key in _currency_rates.index else 0.012
+        else:
+            return 1.0  # Default to USD
+    
+    df['USD_Exchange_Rate'] = df.apply(get_usd_rate, axis=1)
+    df['Trade_Price_USD'] = df['Trade_Price'] * df['USD_Exchange_Rate']
+    df['Total_Cashflow_USD'] = df['Total_Cashflow_Local'] * df['USD_Exchange_Rate']
+    
+    return df
+
+# --- 7. HISTORICAL PRICES ---
+@st.cache_data
+def get_split_adjusted_prices(holdings_list, splits_dict, start_date, end_date):
+    """Step 7: Get split adjusted historical prices/NAVs through yahoo finance"""
+    
+    # Create symbol mapping
+    yf_symbols = []
+    symbol_map = {}
+    
+    for symbol, currency in holdings_list:
+        yf_symbol = f"{symbol}.SI" if currency == 'SGD' else symbol
+        yf_symbols.append(yf_symbol)
+        symbol_map[yf_symbol] = symbol
+    
+    # Add currency rates
+    yf_symbols.extend(['SGDUSD=X', 'INRUSD=X'])
+    
+    # Download prices
+    try:
+        prices = yf.download(yf_symbols, start=start_date, end=end_date, progress=False, auto_adjust=False)['Close']
+        
+        if len(yf_symbols) == 1:
+            prices = prices.to_frame(yf_symbols[0])
+            
+    except Exception as e:
+        st.error(f"Error downloading prices: {e}")
+        return pd.DataFrame()
+    
+    # Create full date range
+    full_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    prices = prices.reindex(full_dates)
+    
+    # Apply manual split adjustments to prices (reverse chronological order)
+    for yf_symbol, orig_symbol in symbol_map.items():
+        if orig_symbol in splits_dict:
+            splits_df = splits_dict[orig_symbol]
+            
+            for _, split_row in splits_df.sort_values('Split_Date', ascending=False).iterrows():
+                split_date = split_row['Split_Date']
+                split_ratio = split_row['Split_Ratio']
+                
+                # Adjust prices before split date
+                pre_split_mask = prices.index < split_date
+                if pre_split_mask.any() and yf_symbol in prices.columns:
+                    prices.loc[pre_split_mask, yf_symbol] /= split_ratio
+    
+    # Forward fill missing values (weekends, holidays)
+    prices = prices.replace(0, pd.NA)
+    prices = prices.fillna(method='ffill').fillna(method='bfill')
+    
+    # Rename columns back to original symbols
+    prices.rename(columns=symbol_map, inplace=True)
+    
+    return prices
+
+# --- 8. DAILY PORTFOLIO VALUE ---
+@st.cache_data
+def compute_daily_portfolio_value(_trades_df, _prices_df, holdings_list):
+    """Step 8: Compute daily portfolio value across currencies"""
+    
+    # Calculate cumulative quantities for each symbol
+    daily_quantities = _trades_df.pivot_table(
+        index='Trade_Date', 
+        columns='Symbol', 
+        values='Quantity', 
+        aggfunc='sum'
+    ).fillna(0).cumsum()
+    
+    # Extend to full date range
+    full_dates = _prices_df.index
+    daily_quantities = daily_quantities.reindex(full_dates, method='ffill').fillna(0)
+    
+    # Calculate daily values in USD
+    portfolio_values = pd.DataFrame(index=full_dates)
+    
+    for symbol, currency in holdings_list:
+        if symbol in _prices_df.columns and symbol in daily_quantities.columns:
+            prices_usd = _prices_df[symbol].copy()
+            
+            # Convert SGD and INR prices to USD
+            if currency == 'SGD':
+                prices_usd = prices_usd * _prices_df['SGDUSD=X']
+            elif currency == 'INR':
+                prices_usd = prices_usd * _prices_df['INRUSD=X']
+            
+            portfolio_values[symbol] = daily_quantities[symbol] * prices_usd
+    
+    # Calculate total portfolio value
+    portfolio_values['Total_Portfolio_Value_USD'] = portfolio_values.sum(axis=1)
+    
+    return portfolio_values, daily_quantities
+
+# --- 9. XIRR CALCULATION ---
+@st.cache_data
+def calculate_xirr_by_holding(_trades_df, _portfolio_values):
+    """Step 9: Compute XIRR for each holding"""
+    xirr_results = {}
+    last_date = _portfolio_values.index[-1]
+    
+    for symbol in _trades_df['Symbol'].unique():
+        symbol_trades = _trades_df[_trades_df['Symbol'] == symbol].copy()
+        
+        if symbol_trades.empty:
+            continue
+        
+        current_quantity = symbol_trades['Quantity'].sum()
+        
+        # Get current value
+        if symbol in _portfolio_values.columns:
+            current_value = _portfolio_values[symbol].iloc[-1]
+        else:
+            current_value = 0
+        
+        # Create cashflow series
+        cashflows = symbol_trades[['Trade_Date', 'Total_Cashflow_USD']].copy()
+        
+        # Add current position as final cashflow if position is open
+        if abs(current_quantity) > 0.001 and current_value > 0:
+            final_cf = pd.DataFrame({
+                'Trade_Date': [last_date],
+                'Total_Cashflow_USD': [current_value]
+            })
+            cashflows = pd.concat([cashflows, final_cf], ignore_index=True)
+        
+        # Calculate XIRR
+        if len(cashflows) > 1:
             try:
-                xirr_value = npf.xirr(cash_flows['Adjusted Cashflow (USD)'].values, cash_flows['Date'].dt.date.values)
-                xirr_results[symbol] = xirr_value if abs(xirr_value) < 10 else None
-            except Exception:
+                xirr_value = npf.xirr(
+                    cashflows['Total_Cashflow_USD'].values, 
+                    cashflows['Trade_Date'].dt.date.values
+                )
+                if abs(xirr_value) < 10:  # Filter extreme values
+                    xirr_results[symbol] = xirr_value
+                else:
+                    xirr_results[symbol] = None
+            except:
                 xirr_results[symbol] = None
         else:
             xirr_results[symbol] = None
+    
     return xirr_results
 
+# --- NEWS FUNCTION ---
 @st.cache_data(ttl=3600)
-def get_news(yfinance_ticker_obj):
+def get_news_google_rss(symbol, currency):
+    """Get news using Google News RSS (no API key needed, no feedparser required)"""
     try:
-        symbol = yfinance_ticker_obj.ticker
-        long_name = yfinance_ticker_obj.info.get('longName', symbol)
-        query = f'"{long_name}" OR "{symbol}"'
+        # Get company name for better search
+        yf_symbol = f"{symbol}.SI" if currency == 'SGD' else symbol
+        try:
+            ticker = yf.Ticker(yf_symbol)
+            info = ticker.info
+            company_name = info.get('longName', '') or info.get('shortName', '') or symbol
+        except:
+            company_name = symbol
+
+        # Google News RSS URL
+        search_query = urllib.parse.quote(f"{symbol} {company_name} stock")
+        rss_url = f"https://news.google.com/rss/search?q={search_query}&hl=en-US&gl=US&ceid=US:en"
+
+        # Fetch RSS feed
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        req = urllib.request.Request(rss_url, headers=headers)
         
-        if not NEWS_API_KEY or "YOUR_NEWS_API_KEY_HERE" in NEWS_API_KEY:
-            return ["Please add a valid NewsAPI.org key to fetch news."]
+        with urllib.request.urlopen(req, timeout=10) as response:
+            xml_data = response.read()
+
+        # Parse XML
+        root = ET.fromstring(xml_data)
         
-        url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}&pageSize=5&sortBy=relevancy&language=en"
+        formatted_news = []
+        items = root.findall('.//item')[:5]  # Get first 5 items
         
-        r = requests.get(url)
-        r.raise_for_status()
-        
-        data = r.json()
-        articles = [f"- [{article['title']}]({article['url']}) ({article['source']['name']})" for article in data['articles']]
-        
-        return articles if articles else ["No recent news found."]
+        if not items:
+            return [f"No Google News found for {symbol}"]
+
+        for item in items:
+            title_elem = item.find('title')
+            link_elem = item.find('link')
+            pub_date_elem = item.find('pubDate')
+            
+            title = title_elem.text if title_elem is not None else 'No title'
+            link = link_elem.text if link_elem is not None else '#'
+            pub_date = pub_date_elem.text if pub_date_elem is not None else ''
+            
+            # Clean up title (remove source attribution if present)
+            title = re.sub(r' - [^-]*$', '', title)
+            
+            # Format date
+            if pub_date:
+                try:
+                    # Parse RFC 2822 date format
+                    date_obj = datetime.strptime(pub_date, '%a, %d %b %Y %H:%M:%S %Z')
+                    date_str = date_obj.strftime('%m/%d')
+                    title = f"{title} ({date_str})"
+                except:
+                    try:
+                        # Alternative date format
+                        date_obj = datetime.strptime(pub_date, '%a, %d %b %Y %H:%M:%S %z')
+                        date_str = date_obj.strftime('%m/%d')
+                        title = f"{title} ({date_str})"
+                    except:
+                        pass  # Skip date formatting if parsing fails
+            
+            formatted_news.append(f"• [{title}]({link})")
+
+        return formatted_news if formatted_news else [f"No news found for {symbol}"]
+
+    except urllib.error.URLError as e:
+        return [f"Network error fetching Google News: {str(e)}"]
+    except ET.ParseError as e:
+        return [f"Error parsing Google News RSS: {str(e)}"]
     except Exception as e:
-        return [f"Could not fetch news. The API may be unavailable or the key may be invalid. (Error: {e})"]
+        return [f"An error occurred fetching Google News: {str(e)}"]
 
-# --- MAIN APP LOGIC ---
-st.set_page_config(layout="wide")
-st.title("Personal Portfolio Performance Analyzer")
 
-trades_df = load_data(FILES)
 
-if not trades_df.empty:
-    holdings = get_holdings(trades_df)
-    adjusted_trades_df = adjust_for_splits(trades_df, holdings)
-    start_date = adjusted_trades_df['Date'].min().date()
-    end_date = datetime.today().date()
-    historical_prices = get_historical_prices(holdings, start_date, end_date)
-    daily_portfolio_value, final_trades_df = calculate_daily_values(adjusted_trades_df, historical_prices)
+# --- 10. MAIN UI ---
+def main():
+    """Step 10: Represent through a simple UI"""
+    st.set_page_config(page_title="Portfolio Analyzer", layout="wide")
+    st.title("📊 Portfolio Performance Analyzer")
     
-    if not daily_portfolio_value.empty:
-        xirr_values = calculate_xirr(final_trades_df, historical_prices)
-        tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "📈 Holdings Analysis", "🗃️ Data Explorer"])
-
-        with tab1:
-            st.header("Portfolio Overview")
-            current_value = daily_portfolio_value['Total Portfolio Value'].iloc[-1]
-            total_investment = final_trades_df[final_trades_df['Adjusted Cashflow (USD)'] < 0]['Adjusted Cashflow (USD)'].sum() * -1
-            total_return_pct = ((current_value - total_investment) / total_investment) * 100 if total_investment > 0 else 0
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Current Portfolio Value (USD)", f"${current_value:,.2f}")
-            col2.metric("Total Investment (USD)", f"${total_investment:,.2f}")
-            col3.metric("Total Return", f"{total_return_pct:.2f}%")
-            
-            st.header("Current Holdings")
-            current_qty = final_trades_df.groupby('Symbol')['Quantity'].sum()
-            current_holdings_df = pd.DataFrame(current_qty).reset_index()
-            current_holdings_df = current_holdings_df[current_holdings_df['Quantity'] > 0.001]
-            latest_prices = historical_prices.iloc[-1]
-            current_holdings_df['Current Price'] = current_holdings_df['Symbol'].map(latest_prices)
-            current_holdings_df['Current Value'] = current_holdings_df['Quantity'] * current_holdings_df['Current Price']
-            total_row = pd.DataFrame({'Symbol': ['**TOTAL**'], 'Quantity': ['-'], 'Current Price': ['-'], 'Current Value': [current_holdings_df['Current Value'].sum()]})
-            display_holdings_df = pd.concat([current_holdings_df, total_row], ignore_index=True)
-            st.dataframe(display_holdings_df.style.format({'Current Price': '${:,.2f}', 'Current Value': '${:,.2f}'}), use_container_width=True)
-            
-            st.header("Daily Portfolio Value History (USD)")
-            st.line_chart(daily_portfolio_value['Total Portfolio Value'])
-
-        with tab2:
-            st.header("Holdings Breakdown")
-            col1, col2 = st.columns([0.6, 0.4])
-            with col1:
-                st.subheader("Performance per Holding (XIRR)")
-                xirr_df = pd.DataFrame(list(xirr_values.items()), columns=['Symbol', 'XIRR'])
-                xirr_df['XIRR'] = xirr_df['XIRR'].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else "N/A")
-                st.dataframe(xirr_df, use_container_width=True)
-            with col2:
-                st.subheader("Latest News")
-                stock_symbols_only = [s for s, c in holdings]
-                selected_stock = st.selectbox("Select a stock for news:", stock_symbols_only)
-                if selected_stock:
-                    selected_currency = [c for s, c in holdings if s == selected_stock][0]
-                    yfinance_symbol = selected_stock + ".SI" if selected_currency == 'SGD' else selected_stock
-                    ticker_obj = yf.Ticker(yfinance_symbol)
-                    news_items = get_news(ticker_obj)
-                    for item in news_items:
-                        st.markdown(item)
+    # Load and process data
+    with st.spinner("Loading and processing data..."):
+        # Step 1: Load data
+        trades_df = load_and_consolidate_data(FILES)
         
-        with tab3:
-            st.header("Detailed Data Tables")
-            with st.expander("Final Calculated Trades"):
-                st.dataframe(final_trades_df)
-            with st.expander("Daily Portfolio Value Breakdown"):
-                st.dataframe(daily_portfolio_value)
+        if trades_df.empty:
+            st.error("No valid trade data found!")
+            return
+        
+        # Step 2: Create master holdings
+        holdings_list = create_master_holdings_list(trades_df)
+        
+        # Step 3: Get splits
+        splits_dict = get_stock_splits(holdings_list)
+        
+        # Step 4: Apply split adjustments
+        adjusted_trades = apply_split_adjustments(trades_df, splits_dict)
+        
+        # Date range
+        start_date = adjusted_trades['Trade_Date'].min().date()
+        end_date = datetime.now().date()
+        
+        # Step 5: Get currency rates
+        currency_rates = get_currency_rates(start_date, end_date)
+        
+        # Step 6: Convert to USD
+        usd_trades = convert_to_usd(adjusted_trades, currency_rates)
+        
+        # Step 7: Get historical prices
+        historical_prices = get_split_adjusted_prices(holdings_list, splits_dict, start_date, end_date)
+        
+        # Step 8: Calculate portfolio values
+        portfolio_values, daily_quantities = compute_daily_portfolio_value(usd_trades, historical_prices, holdings_list)
+        
+        # Step 9: Calculate XIRR
+        xirr_results = calculate_xirr_by_holding(usd_trades, portfolio_values)
+    
+    # Current Holdings Table
+    st.header("📋 Current Holdings Summary")
+    
+    current_holdings = []
+    total_value = 0
+    
+    for symbol, currency in holdings_list:
+        current_qty = daily_quantities[symbol].iloc[-1] if symbol in daily_quantities.columns else 0
+        
+        if symbol in historical_prices.columns:
+            current_price_local = historical_prices[symbol].iloc[-1]
+            
+            # Convert to USD
+            if currency == 'SGD':
+                current_price_usd = current_price_local * historical_prices['SGDUSD=X'].iloc[-1]
+            elif currency == 'INR':
+                current_price_usd = current_price_local * historical_prices['INRUSD=X'].iloc[-1]
+            else:
+                current_price_usd = current_price_local
+                
+            current_value = current_qty * current_price_usd
+            total_value += current_value
+            
+            current_holdings.append({
+                'Symbol': symbol,
+                'Current Quantity': current_qty,
+                'Current Price (USD)': current_price_usd,
+                'Current Value (USD)': current_value
+            })
+    
+    # Sort by value and display
+    holdings_df = pd.DataFrame(current_holdings)
+    if not holdings_df.empty:
+        holdings_df = holdings_df.sort_values('Current Value (USD)', ascending=False)
+        
+        # Add total row
+        total_row = pd.DataFrame({
+            'Symbol': ['TOTAL'],
+            'Current Quantity': ['-'],
+            'Current Price (USD)': ['-'],
+            'Current Value (USD)': [total_value]
+        })
+        
+        display_df = pd.concat([holdings_df, total_row], ignore_index=True)
+        
+        # Format and display
+        st.dataframe(
+            display_df.style.format({
+                'Current Quantity': lambda x: f"{x:,.4f}" if isinstance(x, (int, float)) else x,
+                'Current Price (USD)': lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) else x,
+                'Current Value (USD)': "${:,.2f}"
+            }),
+            use_container_width=True
+        )
+        
+        st.success(f"**Total Portfolio Value: ${total_value:,.2f}**")
+    
+    # Portfolio Overview
+    st.header("📈 Portfolio Performance")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    current_value = portfolio_values['Total_Portfolio_Value_USD'].iloc[-1]
+    total_invested = abs(usd_trades[usd_trades['Total_Cashflow_USD'] < 0]['Total_Cashflow_USD'].sum())
+    total_return = ((current_value - total_invested) / total_invested * 100) if total_invested > 0 else 0
+    
+    col1.metric("Current Value", f"${current_value:,.2f}")
+    col2.metric("Total Invested", f"${total_invested:,.2f}")
+    col3.metric("Total Return", f"{total_return:.2f}%")
+    
+    # Portfolio Value Chart
+    st.subheader("Portfolio Value Over Time")
+    st.line_chart(portfolio_values['Total_Portfolio_Value_USD'])
+    
+    # Tabs for detailed views
+    tab1, tab2, tab3 = st.tabs(["📊 XIRR Analysis", "📰 News", "🗂️ Data Tables"])
+    
+    with tab1:
+        st.subheader("XIRR by Holding")
+        xirr_df = pd.DataFrame([
+            {'Symbol': symbol, 'XIRR': f"{xirr*100:.2f}%" if xirr else "N/A"}
+            for symbol, xirr in xirr_results.items()
+        ])
+        st.dataframe(xirr_df, use_container_width=True)
+    
+    with tab2:
+     st.subheader("Latest News")
+    selected_symbol = st.selectbox("Select symbol for news:", [symbol for symbol, _ in holdings_list])
+    if selected_symbol:
+        selected_currency = next(currency for symbol, currency in holdings_list if symbol == selected_symbol)
+        
+        # Show loading spinner while fetching news
+        with st.spinner(f"Fetching news for {selected_symbol}..."):
+            news = get_news_google_rss(selected_symbol, selected_currency)
+        
+        # Display news items
+        if news:
+            for item in news:
+                st.markdown(item)
+        else:
+            st.info(f"No news found for {selected_symbol}")
+            
+    else:
+        st.info("Please select a symbol to view news")
+ 
+ 
+ 
+    with tab3:
+        st.subheader("Detailed Data")
+        
+        with st.expander("Processed Trades"):
+            st.dataframe(usd_trades)
+        
+        with st.expander("Daily Portfolio Values"):
+            st.dataframe(portfolio_values)
+        
+        with st.expander("Stock Splits Applied"):
+            if splits_dict:
+                split_summary = []
+                for symbol, splits_df in splits_dict.items():
+                    for _, row in splits_df.iterrows():
+                        split_summary.append({
+                            'Symbol': symbol,
+                            'Split Date': row['Split_Date'].date(),
+                            'Split Ratio': row['Split_Ratio']
+                        })
+                st.dataframe(pd.DataFrame(split_summary))
+            else:
+                st.info("No stock splits detected")
+
+if __name__ == "__main__":
+    main()
