@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import numpy_financial as npf
+import numpy as np
 from datetime import datetime, timedelta
 import warnings
 import urllib.parse
@@ -268,55 +269,54 @@ def compute_daily_portfolio_value(_trades_df, _prices_df, holdings_list):
     
     return portfolio_values, daily_quantities
 
-# --- 9. XIRR CALCULATION ---
+# --- 9. XIRR CALCULATION (CORRECTED) ---
 @st.cache_data
 def calculate_xirr_by_holding(_trades_df, _portfolio_values):
-    """Step 9: Compute XIRR for each holding"""
+    """Step 9: Compute XIRR for each holding with corrected logic"""
     xirr_results = {}
     last_date = _portfolio_values.index[-1]
-    
+
     for symbol in _trades_df['Symbol'].unique():
         symbol_trades = _trades_df[_trades_df['Symbol'] == symbol].copy()
-        
+
         if symbol_trades.empty:
             continue
-        
+
+        # FIX: Ensure transactions are sorted by date for correct cashflow order.
+        # This prevents errors where trades might not be chronological.
+        symbol_trades.sort_values(by='Trade_Date', inplace=True)
+
         current_quantity = symbol_trades['Quantity'].sum()
-        
-        # Get current value
-        if symbol in _portfolio_values.columns:
-            current_value = _portfolio_values[symbol].iloc[-1]
-        else:
-            current_value = 0
-        
-        # Create cashflow series
-        cashflows = symbol_trades[['Trade_Date', 'Total_Cashflow_USD']].copy()
-        
-        # Add current position as final cashflow if position is open
+        current_value = _portfolio_values[symbol].iloc[-1] if symbol in _portfolio_values.columns else 0
+
+        # Prepare cashflows and dates from historical trades
+        cashflows = symbol_trades['Total_Cashflow_USD'].tolist()
+        dates = symbol_trades['Trade_Date'].tolist()
+
+        # Add the current market value of the holding as the final cashflow
         if abs(current_quantity) > 0.001 and current_value > 0:
-            final_cf = pd.DataFrame({
-                'Trade_Date': [last_date],
-                'Total_Cashflow_USD': [current_value]
-            })
-            cashflows = pd.concat([cashflows, final_cf], ignore_index=True)
-        
-        # Calculate XIRR
-        if len(cashflows) > 1:
+            cashflows.append(current_value)
+            dates.append(last_date)
+
+        # Calculate XIRR if there are enough data points with both positive and negative flows
+        if len(cashflows) >= 2 and any(cf > 0 for cf in cashflows) and any(cf < 0 for cf in cashflows):
             try:
-                xirr_value = npf.xirr(
-                    cashflows['Total_Cashflow_USD'].values, 
-                    cashflows['Trade_Date'].dt.date.values
-                )
-                if abs(xirr_value) < 10:  # Filter extreme values
+                # npf.xirr requires datetime.date objects
+                date_objects = [d.date() for d in dates]
+                xirr_value = npf.xirr(cashflows, date_objects)
+
+                # Filter out extreme or invalid results
+                if pd.notna(xirr_value) and abs(xirr_value) < 10:  # Cap at 1000%
                     xirr_results[symbol] = xirr_value
                 else:
                     xirr_results[symbol] = None
-            except:
+            except Exception:
                 xirr_results[symbol] = None
         else:
             xirr_results[symbol] = None
-    
+
     return xirr_results
+
 
 # --- NEWS FUNCTION ---
 @st.cache_data(ttl=3600)
@@ -394,6 +394,44 @@ def get_news_google_rss(symbol, currency):
         return [f"An error occurred fetching Google News: {str(e)}"]
 
 
+# --- CORRECTED TOTAL INVESTMENT CALCULATION ---
+def calculate_total_investment(trades_df):
+    """
+    Calculate total investment by summing all purchase cashflows (outflows).
+    This represents the total capital deployed in the portfolio.
+    """
+    # Buy transactions are those with a negative cashflow in USD.
+    buy_cashflows = trades_df[trades_df['Total_Cashflow_USD'] < 0]['Total_Cashflow_USD'].sum()
+    
+    # The sum will be negative, so we take the absolute value for the total investment amount.
+    return abs(buy_cashflows)
+
+
+# --- VALIDATION FUNCTION ---
+def validate_xirr_calculation(_trades_df, _portfolio_values):
+    """Simple validation to check if cashflows make sense"""
+    print("\n=== XIRR Validation ===")
+    
+    # Check first few symbols
+    test_symbols = ['NET', 'MSFT', 'AAPL', 'NVDA']
+    
+    for symbol in test_symbols:
+        if symbol not in _trades_df['Symbol'].unique():
+            continue
+            
+        symbol_trades = _trades_df[_trades_df['Symbol'] == symbol].copy()
+        print(f"\n{symbol}:")
+        print(f"  Number of trades: {len(symbol_trades)}")
+        print(f"  Total quantity: {symbol_trades['Quantity'].sum()}")
+        print(f"  Cashflow range: ${symbol_trades['Total_Cashflow_USD'].min():.2f} to ${symbol_trades['Total_Cashflow_USD'].max():.2f}")
+        
+        # Check if Total_Cashflow_USD has the right signs
+        buys = symbol_trades[symbol_trades['Quantity'] > 0]
+        sells = symbol_trades[symbol_trades['Quantity'] < 0]
+        
+        print(f"  Buy trades cashflow (should be negative): {buys['Total_Cashflow_USD'].tolist()}")
+        print(f"  Sell trades cashflow (should be positive): {sells['Total_Cashflow_USD'].tolist()}")
+
 
 # --- 10. MAIN UI ---
 def main():
@@ -428,13 +466,17 @@ def main():
         
         # Step 6: Convert to USD
         usd_trades = convert_to_usd(adjusted_trades, currency_rates)
-        
+
+       
         # Step 7: Get historical prices
         historical_prices = get_split_adjusted_prices(holdings_list, splits_dict, start_date, end_date)
         
         # Step 8: Calculate portfolio values
         portfolio_values, daily_quantities = compute_daily_portfolio_value(usd_trades, historical_prices, holdings_list)
         
+        # ADD THIS LINE FOR DEBUGGING:
+        validate_xirr_calculation(usd_trades, portfolio_values)
+
         # Step 9: Calculate XIRR
         xirr_results = calculate_xirr_by_holding(usd_trades, portfolio_values)
     
@@ -461,16 +503,17 @@ def main():
             current_value = current_qty * current_price_usd
             total_value += current_value
             
-            current_holdings.append({
-                'Symbol': symbol,
-                'Current Quantity': current_qty,
-                'Current Price (USD)': current_price_usd,
-                'Current Value (USD)': current_value
-            })
+            if abs(current_qty) > 0.001: # Only display if holding quantity is meaningful
+                current_holdings.append({
+                    'Symbol': symbol,
+                    'Current Quantity': current_qty,
+                    'Current Price (USD)': current_price_usd,
+                    'Current Value (USD)': current_value
+                })
     
     # Sort by value and display
-    holdings_df = pd.DataFrame(current_holdings)
-    if not holdings_df.empty:
+    if current_holdings:
+        holdings_df = pd.DataFrame(current_holdings)
         holdings_df = holdings_df.sort_values('Current Value (USD)', ascending=False)
         
         # Add total row
@@ -492,21 +535,26 @@ def main():
             }),
             use_container_width=True
         )
-        
-        st.success(f"**Total Portfolio Value: ${total_value:,.2f}**")
     
     # Portfolio Overview
     st.header("📈 Portfolio Performance")
-    
+
     col1, col2, col3 = st.columns(3)
-    
+
     current_value = portfolio_values['Total_Portfolio_Value_USD'].iloc[-1]
-    total_invested = abs(usd_trades[usd_trades['Total_Cashflow_USD'] < 0]['Total_Cashflow_USD'].sum())
-    total_return = ((current_value - total_invested) / total_invested * 100) if total_invested > 0 else 0
+    # CORRECTED: Use the new function for a clearer "Total Invested" metric
+    total_invested = calculate_total_investment(usd_trades)
     
+    # To calculate total return, we need to account for sales
+    total_sales = usd_trades[usd_trades['Total_Cashflow_USD'] > 0]['Total_Cashflow_USD'].sum()
+    
+    # Total P/L = Current Value + Cash from Sales - Total Investment
+    total_pnl = current_value + total_sales - total_invested
+    total_return_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+
     col1.metric("Current Value", f"${current_value:,.2f}")
     col2.metric("Total Invested", f"${total_invested:,.2f}")
-    col3.metric("Total Return", f"{total_return:.2f}%")
+    col3.metric("Total Return %", f"{total_return_pct:.2f}%", help="Return is calculated as (Current Value + Total Sales - Total Invested) / Total Invested.")
     
     # Portfolio Value Chart
     st.subheader("Portfolio Value Over Time")
@@ -516,42 +564,41 @@ def main():
     tab1, tab2, tab3 = st.tabs(["📊 XIRR Analysis", "📰 News", "🗂️ Data Tables"])
     
     with tab1:
-        st.subheader("XIRR by Holding")
-        xirr_df = pd.DataFrame([
-            {'Symbol': symbol, 'XIRR': f"{xirr*100:.2f}%" if xirr else "N/A"}
-            for symbol, xirr in xirr_results.items()
-        ])
-        st.dataframe(xirr_df, use_container_width=True)
+        st.subheader("XIRR by Holding (Annualized Return)")
+        if xirr_results:
+            xirr_df = pd.DataFrame([
+                {'Symbol': symbol, 'XIRR': f"{xirr*100:.2f}%" if xirr is not None else "N/A"}
+                for symbol, xirr in xirr_results.items()
+            ])
+            st.dataframe(xirr_df.sort_values(by='Symbol'), use_container_width=True)
+        else:
+            st.info("Could not calculate XIRR for any holdings.")
     
     with tab2:
-     st.subheader("Latest News")
-    selected_symbol = st.selectbox("Select symbol for news:", [symbol for symbol, _ in holdings_list])
-    if selected_symbol:
-        selected_currency = next(currency for symbol, currency in holdings_list if symbol == selected_symbol)
-        
-        # Show loading spinner while fetching news
-        with st.spinner(f"Fetching news for {selected_symbol}..."):
-            news = get_news_google_rss(selected_symbol, selected_currency)
-        
-        # Display news items
-        if news:
-            for item in news:
-                st.markdown(item)
+        st.subheader("Latest News")
+        if holdings_list:
+            selected_symbol = st.selectbox("Select symbol for news:", [symbol for symbol, _ in holdings_list])
+            if selected_symbol:
+                selected_currency = next(currency for symbol, currency in holdings_list if symbol == selected_symbol)
+                
+                with st.spinner(f"Fetching news for {selected_symbol}..."):
+                    news = get_news_google_rss(selected_symbol, selected_currency)
+                
+                if news:
+                    for item in news:
+                        st.markdown(item, unsafe_allow_html=True)
+                else:
+                    st.info(f"No news found for {selected_symbol}")
         else:
-            st.info(f"No news found for {selected_symbol}")
-            
-    else:
-        st.info("Please select a symbol to view news")
- 
- 
+            st.info("No holdings to select.")
  
     with tab3:
         st.subheader("Detailed Data")
         
-        with st.expander("Processed Trades"):
+        with st.expander("Processed & USD Converted Trades"):
             st.dataframe(usd_trades)
         
-        with st.expander("Daily Portfolio Values"):
+        with st.expander("Daily Portfolio Values (USD)"):
             st.dataframe(portfolio_values)
         
         with st.expander("Stock Splits Applied"):
