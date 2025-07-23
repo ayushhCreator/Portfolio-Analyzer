@@ -272,45 +272,45 @@ def compute_daily_portfolio_value(_trades_df, _prices_df, holdings_list):
 # --- 9. XIRR CALCULATION (CORRECTED) ---
 @st.cache_data
 def calculate_xirr_by_holding(_trades_df, _portfolio_values):
-    """Step 9: Compute XIRR for each holding with corrected logic"""
+    """Compute XIRR for each holding: buy = negative, sell = positive, add current value if holding exists."""
     xirr_results = {}
     last_date = _portfolio_values.index[-1]
 
     for symbol in _trades_df['Symbol'].unique():
         symbol_trades = _trades_df[_trades_df['Symbol'] == symbol].copy()
-
         if symbol_trades.empty:
+            xirr_results[symbol] = None
             continue
 
-        # FIX: Ensure transactions are sorted by date for correct cashflow order.
-        # This prevents errors where trades might not be chronological.
+        # Chronological order
         symbol_trades.sort_values(by='Trade_Date', inplace=True)
 
-        current_quantity = symbol_trades['Quantity'].sum()
-        current_value = _portfolio_values[symbol].iloc[-1] if symbol in _portfolio_values.columns else 0
-
-        # Prepare cashflows and dates from historical trades
+        # Prepare cashflows
         cashflows = symbol_trades['Total_Cashflow_USD'].tolist()
         dates = symbol_trades['Trade_Date'].tolist()
 
-        # Add the current market value of the holding as the final cashflow
-        if abs(current_quantity) > 0.001 and current_value > 0:
+        # Current holding value
+        current_quantity = symbol_trades['Quantity'].sum()
+        current_value = _portfolio_values[symbol].iloc[-1] if symbol in _portfolio_values.columns else 0
+
+        # If still holding shares, add current market value as last positive cashflow
+        # If position is closed (all sold), do not add
+        if abs(current_quantity) > 1e-6:
             cashflows.append(current_value)
             dates.append(last_date)
 
-        # Calculate XIRR if there are enough data points with both positive and negative flows
+        # XIRR requires at least one positive and one negative cashflow
         if len(cashflows) >= 2 and any(cf > 0 for cf in cashflows) and any(cf < 0 for cf in cashflows):
             try:
-                # npf.xirr requires datetime.date objects
+                # Use .date() for each date for npf.xirr
                 date_objects = [d.date() for d in dates]
                 xirr_value = npf.xirr(cashflows, date_objects)
-
-                # Filter out extreme or invalid results
-                if pd.notna(xirr_value) and abs(xirr_value) < 10:  # Cap at 1000%
+                # Filter out extreme values
+                if pd.notna(xirr_value) and abs(xirr_value) < 10:
                     xirr_results[symbol] = xirr_value
                 else:
                     xirr_results[symbol] = None
-            except Exception:
+            except Exception as e:
                 xirr_results[symbol] = None
         else:
             xirr_results[symbol] = None
