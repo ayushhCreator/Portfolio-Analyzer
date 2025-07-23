@@ -1,0 +1,84 @@
+/* Portfolio Analyzer CSS */
+
+body {
+    background-color: #f8f9fa;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.card {
+    border: none;
+    border-radius: 10px;
+    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+    margin-bottom: 1.5rem;
+}
+
+.card-header {
+    background-color: #fff;
+    border-bottom: 1px solid #dee2e6;
+    border-radius: 10px 10px 0 0 !important;
+    font-weight: 600;
+}
+
+.table th {
+    font-weight: 600;
+    color: #495057;
+    border-top: none;
+}
+
+.navbar-brand {
+    font-size: 1.5rem;
+    font-weight: 600;
+}
+
+.nav-tabs .nav-link {
+    border: none;
+    color: #495057;
+    font-weight: 500;
+}
+
+.nav-tabs .nav-link.active {
+    background-color: #007bff;
+    color: white;
+    border-radius: 8px 8px 0 0;
+}
+
+.tab-content {
+    background-color: white;
+    border-radius: 0 0 10px 10px;
+    padding: 0;
+}
+
+.news-item {
+    padding: 10px;
+    border-bottom: 1px solid #dee2e6;
+}
+
+.news-item:last-child {
+    border-bottom: none;
+}
+
+.news-item a {
+    text-decoration: none;
+    color: #007bff;
+}
+
+.news-item a:hover {
+    text-decoration: underline;
+}
+
+#portfolioChart {
+    max-height: 400px;
+}
+
+.accordion-button:not(.collapsed) {
+    background-color: #e3f2fd;
+    color: #1976d2;
+}
+
+.text-success {
+    color: #28a745 !important;
+}
+
+.text-danger {
+    color: #dc3545 !important;
+}
