@@ -8,7 +8,7 @@
 
 A comprehensive portfolio analysis web application that processes multi-year trading data, calculates advanced financial metrics including XIRR, and provides real-time market insights through an intuitive interface.
 
-![Portfolio Analyzer Demo](https://via.placeholder.com/800x400/1f1f1f/ffffff?text=Portfolio+Analyzer+Dashboard)
+![Portfolio Analyzer ](https://portfolio-analyzer-app.streamlit.app/)
 
 ---
 
