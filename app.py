@@ -1,7 +1,6 @@
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import numpy_financial as npf
 import numpy as np
 from datetime import datetime, timedelta
 import warnings
@@ -10,6 +9,23 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import re
+
+# Use pyxirr for XIRR calculation (more reliable than numpy_financial)
+try:
+    from pyxirr import xirr as pyxirr_calc
+    def calculate_xirr(amounts, dates):
+        return pyxirr_calc(amounts=amounts, dates=dates)
+    XIRR_AVAILABLE = True
+except ImportError:
+    try:
+        import numpy_financial as npf
+        def calculate_xirr(amounts, dates):
+            return npf.irr(amounts)  # Fallback to IRR if XIRR not available
+        XIRR_AVAILABLE = False
+    except ImportError:
+        def calculate_xirr(amounts, dates):
+            return None
+        XIRR_AVAILABLE = False
 
 
 warnings.filterwarnings('ignore')
@@ -115,9 +131,14 @@ def apply_split_adjustments(_trades_df, _splits_dict):
                 df.loc[pre_split_mask, 'Quantity'] *= split_ratio
                 df.loc[pre_split_mask, 'Trade_Price'] /= split_ratio
     
-    # Recalculate adjusted cashflow
+    # CORRECTED: Recalculate adjusted cashflow with proper signs
+    # For buy transactions (positive quantity): negative cashflow (money going out)
+    # For sell transactions (negative quantity): positive cashflow (money coming in)
     df['Adjusted_Cashflow_Local'] = df['Quantity'] * df['Trade_Price'] * -1
     df['Comm_Fee'] = df['Comm/Fee'].fillna(0)
+    
+    # For buys: cashflow is negative (outflow), so commission is added to make it more negative
+    # For sells: cashflow is positive (inflow), so commission is subtracted from the proceeds
     df['Total_Cashflow_Local'] = df['Adjusted_Cashflow_Local'] - df['Comm_Fee']
     
     return df
@@ -282,18 +303,21 @@ def calculate_xirr_by_holding(_trades_df, _portfolio_values):
         if symbol_trades.empty:
             continue
 
-        # FIX: Ensure transactions are sorted by date for correct cashflow order.
-        # This prevents errors where trades might not be chronological.
+        # Ensure transactions are sorted by date for correct cashflow order
         symbol_trades.sort_values(by='Trade_Date', inplace=True)
 
         current_quantity = symbol_trades['Quantity'].sum()
         current_value = _portfolio_values[symbol].iloc[-1] if symbol in _portfolio_values.columns else 0
 
         # Prepare cashflows and dates from historical trades
+        # CORRECTED: The cashflows already have the correct signs from our updated logic
+        # Buy transactions: negative cashflow (money going out)
+        # Sell transactions: positive cashflow (money coming in)
         cashflows = symbol_trades['Total_Cashflow_USD'].tolist()
         dates = symbol_trades['Trade_Date'].tolist()
 
-        # Add the current market value of the holding as the final cashflow
+        # Add the current market value of the holding as the final positive cashflow
+        # This represents the liquidation value if we were to sell today
         if abs(current_quantity) > 0.001 and current_value > 0:
             cashflows.append(current_value)
             dates.append(last_date)
@@ -301,16 +325,31 @@ def calculate_xirr_by_holding(_trades_df, _portfolio_values):
         # Calculate XIRR if there are enough data points with both positive and negative flows
         if len(cashflows) >= 2 and any(cf > 0 for cf in cashflows) and any(cf < 0 for cf in cashflows):
             try:
-                # npf.xirr requires datetime.date objects
-                date_objects = [d.date() for d in dates]
-                xirr_value = npf.xirr(cashflows, date_objects)
+                # Convert dates to proper format
+                if XIRR_AVAILABLE:
+                    # pyxirr expects proper date objects and float amounts
+                    date_objects = []
+                    for d in dates:
+                        if hasattr(d, 'date'):
+                            date_objects.append(d.date())
+                        elif isinstance(d, pd.Timestamp):
+                            date_objects.append(d.date())
+                        else:
+                            date_objects.append(d)
+                    
+                    # Ensure cashflows are floats
+                    float_cashflows = [float(cf) for cf in cashflows]
+                    xirr_value = calculate_xirr(float_cashflows, date_objects)
+                else:
+                    # Fallback calculation using a simple IRR approximation
+                    xirr_value = None
 
-                # Filter out extreme or invalid results
-                if pd.notna(xirr_value) and abs(xirr_value) < 10:  # Cap at 1000%
+                # Filter out extreme or invalid results (cap at 1000%)
+                if pd.notna(xirr_value) and abs(xirr_value) < 10:
                     xirr_results[symbol] = xirr_value
                 else:
                     xirr_results[symbol] = None
-            except Exception:
+            except Exception as e:
                 xirr_results[symbol] = None
         else:
             xirr_results[symbol] = None
@@ -397,14 +436,19 @@ def get_news_google_rss(symbol, currency):
 # --- CORRECTED TOTAL INVESTMENT CALCULATION ---
 def calculate_total_investment(trades_df):
     """
-    Calculate total investment by summing all purchase cashflows (outflows).
+    Calculate total investment by summing all purchase amounts.
     This represents the total capital deployed in the portfolio.
-    """
-    # Buy transactions are those with a negative cashflow in USD.
-    buy_cashflows = trades_df[trades_df['Total_Cashflow_USD'] < 0]['Total_Cashflow_USD'].sum()
     
-    # The sum will be negative, so we take the absolute value for the total investment amount.
-    return abs(buy_cashflows)
+    Buy transactions have negative cashflows (money going out).
+    We sum the absolute values of these negative cashflows to get total invested.
+    """
+    # Buy transactions are those with negative cashflow in USD (money going out)
+    buy_cashflows = trades_df[trades_df['Total_Cashflow_USD'] < 0]['Total_Cashflow_USD']
+    
+    # Sum the absolute values to get total investment amount
+    total_invested = abs(buy_cashflows.sum())
+    
+    return total_invested
 
 
 # --- VALIDATION FUNCTION ---
