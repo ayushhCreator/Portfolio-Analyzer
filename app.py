@@ -34,7 +34,15 @@ warnings.filterwarnings('ignore')
 
 # --- CONFIGURATION ---
 BASE_CURRENCY = "USD"
-FILES = ['Stock_trading_2023.csv', 'Stock_trading_2024.csv', 'Stock_trading_2025.csv']
+import os
+
+# Get the path to data files 
+DATA_DIR = os.path.join('data', 'raw')
+FILES = [
+    os.path.join(DATA_DIR, 'Stock_trading_2023.csv'),
+    os.path.join(DATA_DIR, 'Stock_trading_2024.csv'), 
+    os.path.join(DATA_DIR, 'Stock_trading_2025.csv')
+]
 
 # --- 1. DATA LOADING & CLEANING ---
 @st.cache_data
