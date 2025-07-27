@@ -116,6 +116,7 @@ def main():
         "📊 Performance Analytics", 
         "🎯 Diversification Analysis",
         "📈 Historical Performance",
+        "💰 Transaction Details",
         "� Portfolio Insights",
         "�🔍 Stock Research",
         "⚙️ Data Management"
@@ -135,6 +136,9 @@ def main():
     
     elif selected_tab == "📈 Historical Performance":
         historical_performance_tab(analytics, selected_user)
+    
+    elif selected_tab == "💰 Transaction Details":
+        transaction_details_tab(analytics, selected_user, data_models)
     
     elif selected_tab == "� Portfolio Insights":
         portfolio_insights_tab(insights_engine, selected_user, data_models)
@@ -197,16 +201,52 @@ def portfolio_overview_tab(analytics, user_id, data_models):
     st.divider()
     
     # Holdings table
-    st.subheader("📋 Current Holdings")
+    st.subheader("📋 Current Holdings with Buy/Sell Details")
     
     # Format holdings for display
     display_holdings = holdings.copy()
+    
+    # Create detailed columns for display
+    display_holdings['Buy Details'] = display_holdings.apply(lambda row: 
+        f"Avg: ${row['avg_cost']:.2f}\n" +
+        f"Range: ${row['min_buy_price']:.2f} - ${row['max_buy_price']:.2f}" if row['min_buy_price'] else f"Avg: ${row['avg_cost']:.2f}", 
+        axis=1
+    )
+    
+    display_holdings['Sell Details'] = display_holdings.apply(lambda row:
+        f"Avg: ${row['avg_sell_price']:.2f}\n" +
+        f"Range: ${row['min_sell_price']:.2f} - ${row['max_sell_price']:.2f}" 
+        if row['avg_sell_price'] else "No Sales", 
+        axis=1
+    )
+    
+    display_holdings['Transaction Summary'] = display_holdings.apply(lambda row:
+        f"Bought: {row['total_bought']:.0f}\n" +
+        f"Sold: {row['total_sold']:.0f}\n" +
+        f"Holding: {row['quantity']:.0f}",
+        axis=1
+    )
+    
+    # Format financial columns
     display_holdings['unrealized_pnl_pct'] = display_holdings['unrealized_pnl_pct'].apply(
         lambda x: f"{x:+.2f}%" 
     )
     display_holdings['unrealized_pnl'] = display_holdings['unrealized_pnl'].apply(
         lambda x: f"${x:+,.2f}"
     )
+    display_holdings['current_value'] = display_holdings['current_value'].apply(
+        lambda x: f"${x:,.2f}"
+    )
+    display_holdings['current_price'] = display_holdings['current_price'].apply(
+        lambda x: f"${x:.2f}"
+    )
+    
+    # Select columns for display
+    display_columns = [
+        'symbol', 'company_name', 'Transaction Summary', 'Buy Details', 
+        'Sell Details', 'current_price', 'current_value', 
+        'unrealized_pnl', 'unrealized_pnl_pct'
+    ]
     
     # Color code the P&L columns
     def color_pnl(val):
@@ -216,7 +256,7 @@ def portfolio_overview_tab(analytics, user_id, data_models):
             return 'color: red'
         return 'color: black'
     
-    styled_holdings = display_holdings.style.applymap(
+    styled_holdings = display_holdings[display_columns].style.map(
         color_pnl, subset=['unrealized_pnl', 'unrealized_pnl_pct']
     )
     
@@ -815,6 +855,133 @@ def portfolio_insights_tab(insights_engine, selected_user, data_models):
             except Exception as e:
                 st.error(f"Error generating insights: {str(e)}")
                 st.info("This might be due to network connectivity or data availability issues.")
+
+def transaction_details_tab(analytics, user_id, data_models):
+    """Detailed transaction history and buy/sell analysis"""
+    st.header("💰 Transaction Details")
+    
+    # Get user info
+    user_info = data_models.dim_user[data_models.dim_user['user_id'] == user_id].iloc[0]
+    st.subheader(f"Transaction History for: {user_info['user_name']}")
+    
+    # Buy/Sell Summary
+    st.subheader("📊 Buy/Sell Summary by Stock")
+    buy_sell_summary = analytics.get_buy_sell_summary(user_id)
+    
+    if not buy_sell_summary.empty:
+        # Format the summary for better display
+        display_summary = buy_sell_summary.copy()
+        
+        # Format monetary columns
+        display_summary['total_amount'] = display_summary['total_amount'].apply(lambda x: f"${x:,.2f}")
+        display_summary['total_fees'] = display_summary['total_fees'].apply(lambda x: f"${x:.2f}")
+        display_summary['avg_price'] = display_summary['avg_price'].apply(lambda x: f"${x:.2f}")
+        display_summary['min_price'] = display_summary['min_price'].apply(lambda x: f"${x:.2f}")
+        display_summary['max_price'] = display_summary['max_price'].apply(lambda x: f"${x:.2f}")
+        
+        # Rename columns for better readability
+        display_summary = display_summary.rename(columns={
+            'symbol': 'Stock',
+            'transaction_type': 'Type',
+            'total_quantity': 'Total Qty',
+            'total_amount': 'Total Amount',
+            'total_fees': 'Total Fees',
+            'avg_price': 'Avg Price',
+            'min_price': 'Min Price',
+            'max_price': 'Max Price',
+            'transaction_count': 'Transactions',
+            'first_date': 'First Date',
+            'last_date': 'Last Date'
+        })
+        
+        # Color code by transaction type
+        def color_transaction_type(val):
+            if val == 'Buy':
+                return 'background-color: #d4edda'  # Light green
+            elif val == 'Sell':
+                return 'background-color: #f8d7da'  # Light red
+            return ''
+        
+        styled_summary = display_summary.style.map(color_transaction_type, subset=['Type'])
+        st.dataframe(styled_summary, use_container_width=True)
+        
+        # Stock selection for detailed view
+        st.subheader("🔍 Detailed Transaction History")
+        
+        # Get unique stocks
+        stocks = analytics.get_current_holdings(user_id)['symbol'].tolist()
+        all_transactions = analytics.get_stock_transaction_details(user_id)
+        all_stocks = all_transactions['symbol'].unique().tolist() if not all_transactions.empty else []
+        
+        # Combine current holdings and all transaction stocks
+        all_available_stocks = list(set(stocks + all_stocks))
+        
+        if all_available_stocks:
+            selected_stock = st.selectbox(
+                "Select a stock to view detailed transactions:",
+                options=['All Stocks'] + sorted(all_available_stocks)
+            )
+            
+            if selected_stock == 'All Stocks':
+                transaction_details = analytics.get_stock_transaction_details(user_id)
+            else:
+                transaction_details = analytics.get_stock_transaction_details(user_id, selected_stock)
+            
+            if not transaction_details.empty:
+                # Format the transaction details
+                display_details = transaction_details.copy()
+                display_details['price'] = display_details['price'].apply(lambda x: f"${x:.2f}")
+                display_details['total_amount'] = display_details['total_amount'].apply(lambda x: f"${x:,.2f}")
+                display_details['fees'] = display_details['fees'].apply(lambda x: f"${x:.2f}")
+                display_details['total_with_fees'] = display_details['total_with_fees'].apply(lambda x: f"${x:,.2f}")
+                
+                # Rename columns
+                display_details = display_details.rename(columns={
+                    'symbol': 'Stock',
+                    'date': 'Date',
+                    'transaction_type': 'Type',
+                    'quantity': 'Quantity',
+                    'price': 'Price',
+                    'total_amount': 'Total Amount',
+                    'fees': 'Fees',
+                    'total_with_fees': 'Total with Fees'
+                })
+                
+                # Color code by transaction type
+                styled_details = display_details.style.map(color_transaction_type, subset=['Type'])
+                st.dataframe(styled_details, use_container_width=True)
+                
+                # Transaction summary for selected stock
+                if selected_stock != 'All Stocks':
+                    stock_summary = display_details.groupby('Type').agg({
+                        'Quantity': 'sum',
+                        'Total Amount': lambda x: len(x)  # Count transactions
+                    }).reset_index()
+                    stock_summary.columns = ['Transaction Type', 'Total Quantity', 'Number of Transactions']
+                    
+                    st.subheader(f"📈 Summary for {selected_stock}")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.dataframe(stock_summary, use_container_width=True)
+                    
+                    with col2:
+                        # Show buy vs sell chart if both exist
+                        if len(stock_summary) > 1:
+                            fig = px.pie(
+                                stock_summary, 
+                                values='Total Quantity', 
+                                names='Transaction Type',
+                                title=f"Buy vs Sell Quantity for {selected_stock}",
+                                color_discrete_map={'Buy': 'green', 'Sell': 'red'}
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info(f"No transaction details found for {selected_stock}")
+        else:
+            st.info("No transaction data available.")
+    else:
+        st.warning("No transaction data found for this user.")
 
 if __name__ == "__main__":
     main()
