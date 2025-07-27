@@ -53,7 +53,21 @@ class PortfolioAnalytics:
             if net_quantity > 0:  # Only include if still holding
                 # Calculate average cost
                 buy_txns = symbol_txns[symbol_txns['transaction_type'] == 'Buy']
+                sell_txns = symbol_txns[symbol_txns['transaction_type'] == 'Sell']
+                
                 avg_cost = (buy_txns['quantity'] * buy_txns['price']).sum() / buy_txns['quantity'].sum()
+                
+                # Get buy/sell price details
+                min_buy_price = buy_txns['price'].min() if not buy_txns.empty else None
+                max_buy_price = buy_txns['price'].max() if not buy_txns.empty else None
+                avg_sell_price = (sell_txns['quantity'] * sell_txns['price']).sum() / sell_txns['quantity'].sum() if not sell_txns.empty else None
+                min_sell_price = sell_txns['price'].min() if not sell_txns.empty else None
+                max_sell_price = sell_txns['price'].max() if not sell_txns.empty else None
+                
+                # Get first and last transaction dates
+                first_buy_date = buy_txns['date'].min() if not buy_txns.empty else None
+                last_buy_date = buy_txns['date'].max() if not buy_txns.empty else None
+                last_sell_date = sell_txns['date'].max() if not sell_txns.empty else None
                 
                 # Get current price
                 current_price = self._get_current_price(symbol)
@@ -70,7 +84,17 @@ class PortfolioAnalytics:
                     'sector': stock_info['sector'].iloc[0] if not stock_info.empty else 'Unknown',
                     'industry': stock_info['industry'].iloc[0] if not stock_info.empty else 'Unknown',
                     'quantity': net_quantity,
+                    'total_bought': total_bought,
+                    'total_sold': total_sold,
                     'avg_cost': round(avg_cost, 2),
+                    'min_buy_price': round(min_buy_price, 2) if min_buy_price else None,
+                    'max_buy_price': round(max_buy_price, 2) if max_buy_price else None,
+                    'avg_sell_price': round(avg_sell_price, 2) if avg_sell_price else None,
+                    'min_sell_price': round(min_sell_price, 2) if min_sell_price else None,
+                    'max_sell_price': round(max_sell_price, 2) if max_sell_price else None,
+                    'first_buy_date': first_buy_date,
+                    'last_buy_date': last_buy_date,
+                    'last_sell_date': last_sell_date,
                     'current_price': current_price,
                     'current_value': round(current_value, 2),
                     'total_cost': round(net_quantity * avg_cost, 2),
@@ -80,6 +104,82 @@ class PortfolioAnalytics:
                 holdings.append(holding)
         
         return pd.DataFrame(holdings)
+    
+    def get_stock_transaction_details(self, user_id: str, symbol: str = None) -> pd.DataFrame:
+        """
+        Get detailed transaction history for a specific stock or all stocks
+        """
+        user_transactions = self.data_models.fact_portfolio_transactions[
+            self.data_models.fact_portfolio_transactions['user_id'] == user_id
+        ].copy()
+        
+        if symbol:
+            user_transactions = user_transactions[user_transactions['symbol'] == symbol]
+        
+        if user_transactions.empty:
+            return pd.DataFrame()
+        
+        # Sort by date
+        user_transactions = user_transactions.sort_values(['symbol', 'date'])
+        
+        # Add additional calculated fields
+        user_transactions['total_with_fees'] = user_transactions['total_amount'] + user_transactions['fees']
+        
+        return user_transactions[['symbol', 'date', 'transaction_type', 'quantity', 'price', 
+                                'total_amount', 'fees', 'total_with_fees']]
+    
+    def get_buy_sell_summary(self, user_id: str) -> pd.DataFrame:
+        """
+        Get summary of buy and sell transactions by stock
+        """
+        user_transactions = self.data_models.fact_portfolio_transactions[
+            self.data_models.fact_portfolio_transactions['user_id'] == user_id
+        ].copy()
+        
+        if user_transactions.empty:
+            return pd.DataFrame()
+        
+        summary = []
+        for symbol in user_transactions['symbol'].unique():
+            symbol_txns = user_transactions[user_transactions['symbol'] == symbol]
+            
+            buy_txns = symbol_txns[symbol_txns['transaction_type'] == 'Buy']
+            sell_txns = symbol_txns[symbol_txns['transaction_type'] == 'Sell']
+            
+            buy_summary = {
+                'symbol': symbol,
+                'transaction_type': 'Buy',
+                'total_quantity': buy_txns['quantity'].sum() if not buy_txns.empty else 0,
+                'total_amount': buy_txns['total_amount'].sum() if not buy_txns.empty else 0,
+                'total_fees': buy_txns['fees'].sum() if not buy_txns.empty else 0,
+                'avg_price': (buy_txns['quantity'] * buy_txns['price']).sum() / buy_txns['quantity'].sum() if not buy_txns.empty else 0,
+                'min_price': buy_txns['price'].min() if not buy_txns.empty else 0,
+                'max_price': buy_txns['price'].max() if not buy_txns.empty else 0,
+                'transaction_count': len(buy_txns),
+                'first_date': buy_txns['date'].min() if not buy_txns.empty else None,
+                'last_date': buy_txns['date'].max() if not buy_txns.empty else None
+            }
+            
+            sell_summary = {
+                'symbol': symbol,
+                'transaction_type': 'Sell',
+                'total_quantity': sell_txns['quantity'].sum() if not sell_txns.empty else 0,
+                'total_amount': sell_txns['total_amount'].sum() if not sell_txns.empty else 0,
+                'total_fees': sell_txns['fees'].sum() if not sell_txns.empty else 0,
+                'avg_price': (sell_txns['quantity'] * sell_txns['price']).sum() / sell_txns['quantity'].sum() if not sell_txns.empty else 0,
+                'min_price': sell_txns['price'].min() if not sell_txns.empty else 0,
+                'max_price': sell_txns['price'].max() if not sell_txns.empty else 0,
+                'transaction_count': len(sell_txns),
+                'first_date': sell_txns['date'].min() if not sell_txns.empty else None,
+                'last_date': sell_txns['date'].max() if not sell_txns.empty else None
+            }
+            
+            if buy_summary['total_quantity'] > 0:
+                summary.append(buy_summary)
+            if sell_summary['total_quantity'] > 0:
+                summary.append(sell_summary)
+        
+        return pd.DataFrame(summary)
     
     def calculate_portfolio_xirr(self, user_id: str) -> Dict:
         """

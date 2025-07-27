@@ -119,7 +119,7 @@ def main():
         "💰 Transaction Details",
         "� Portfolio Insights",
         "�🔍 Stock Research",
-        "⚙️ Data Management"
+        # "⚙️ Data Management"
     ]
     
     selected_tab = st.sidebar.radio("Select Analysis", tab_options)
@@ -146,8 +146,8 @@ def main():
     elif selected_tab == "�🔍 Stock Research":
         stock_research_tab(data_models)
     
-    elif selected_tab == "⚙️ Data Management":
-        data_management_tab(data_models)
+    # elif selected_tab == "⚙️ Data Management":
+    #     data_management_tab(data_models)
 
 def portfolio_overview_tab(analytics, user_id, data_models):
     """Portfolio overview and current holdings"""
